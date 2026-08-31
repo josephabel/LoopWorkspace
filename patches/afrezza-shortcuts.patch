@@ -1,3 +1,16 @@
+diff --git a/Loop/Loop/Info.plist b/Loop/Loop/Info.plist
+index db76e6e..3578767 100644
+--- a/Loop/Loop/Info.plist
++++ b/Loop/Loop/Info.plist
+@@ -57,6 +57,8 @@
+ 	<string>$(LOOP_LOCAL_CACHE_DURATION_DAYS)</string>
+ 	<key>NFCReaderUsageDescription</key>
+ 	<string>The app uses NFC to pair with diabetes devices.</string>
++	<key>NSAlarmKitUsageDescription</key>
++	<string>Alarms are used to remind you to take a non-pump insulin dose (such as Afrezza) that you logged ahead of time.</string>
+ 	<key>NSBluetoothAlwaysUsageDescription</key>
+ 	<string>The app needs to use Bluetooth to send and receive data from your diabetes devices.</string>
+ 	<key>NSBluetoothPeripheralUsageDescription</key>
 diff --git a/Loop/Loop/Managers/LoopAppManager.swift b/Loop/Loop/Managers/LoopAppManager.swift
 index 3f00104..d8c0f54 100644
 --- a/Loop/Loop/Managers/LoopAppManager.swift
@@ -28,10 +41,27 @@ index 3f00104..d8c0f54 100644
          case NotificationManager.Action.retryBolus.rawValue:
              if  let units = response.notification.request.content.userInfo[LoopNotificationUserInfoKey.bolusAmount.rawValue] as? Double,
 diff --git a/Loop/Loop/Managers/NotificationManager.swift b/Loop/Loop/Managers/NotificationManager.swift
-index 996d147..af2b857 100644
+index 996d147..e881132 100644
 --- a/Loop/Loop/Managers/NotificationManager.swift
 +++ b/Loop/Loop/Managers/NotificationManager.swift
-@@ -16,10 +16,15 @@ enum NotificationManager {
+@@ -8,18 +8,32 @@
+ 
+ import UIKit
+ import UserNotifications
++import SwiftUI
+ import LoopKit
+ import LoopCore
++#if canImport(AlarmKit)
++import AlarmKit
++#endif
++
++#if canImport(AlarmKit)
++@available(iOS 26.0, *)
++struct InsulinReminderAlarmMetadata: AlarmMetadata {}
++#endif
+ 
+ enum NotificationManager {
+ 
      enum Action: String {
          case retryBolus
          case acknowledgeAlert
@@ -47,7 +77,7 @@ index 996d147..af2b857 100644
      private static var notificationCategories: Set<UNNotificationCategory> {
          var categories = [UNNotificationCategory]()
  
-@@ -49,9 +54,96 @@ extension NotificationManager {
+@@ -49,9 +63,156 @@ extension NotificationManager {
              options: .customDismissAction
          ))
  
@@ -109,6 +139,66 @@ index 996d147..af2b857 100644
 +        }
 +    }
 +
++    /// Entry point for the future-dose reminder. On iOS 26+ this fires a real AlarmKit alarm that
++    /// rings through silent mode / Focus like the Clock app; on older iOS it falls back to the
++    /// time-sensitive notification series.
++    static func scheduleInsulinReminder(at fireDate: Date, units: Double, insulinType: InsulinType?) {
++        #if canImport(AlarmKit)
++        if #available(iOS 26.0, *) {
++            scheduleInsulinAlarm(at: fireDate, units: units, insulinType: insulinType)
++            return
++        }
++        #endif
++        scheduleInsulinReminders(at: fireDate, units: units, insulinType: insulinType)
++    }
++
++    #if canImport(AlarmKit)
++    @available(iOS 26.0, *)
++    static func scheduleInsulinAlarm(at fireDate: Date, units: Double, insulinType: InsulinType?) {
++        guard fireDate.timeIntervalSinceNow > 0 else { return }
++
++        let unitsString = insulinReminderNumberFormatter.string(from: NSNumber(value: units)) ?? String(units)
++        let typeString = insulinType?.title ?? NSLocalizedString("insulin", comment: "Generic insulin name used in the reminder when the type is unknown")
++        let alarmTitle = String(format: NSLocalizedString("Take %1$@ U of %2$@", comment: "Alarm title reminding the user to take a logged insulin dose (1: units, 2: insulin type)"), unitsString, typeString)
++
++        Task {
++            let manager = AlarmManager.shared
++            let authorized: Bool
++            switch manager.authorizationState {
++            case .authorized:
++                authorized = true
++            case .notDetermined:
++                authorized = ((try? await manager.requestAuthorization()) == .authorized)
++            default:
++                authorized = false
++            }
++            guard authorized else { return }
++
++            let alert = AlarmPresentation.Alert(
++                title: LocalizedStringResource(stringLiteral: alarmTitle),
++                stopButton: AlarmButton(
++                    text: "Taken",
++                    textColor: .white,
++                    systemImageName: "checkmark"
++                )
++            )
++            let attributes = AlarmAttributes<InsulinReminderAlarmMetadata>(
++                presentation: AlarmPresentation(alert: alert),
++                metadata: nil,
++                tintColor: Color(red: 33.0 / 255.0, green: 124.0 / 255.0, blue: 137.0 / 255.0)
++            )
++            let configuration = AlarmManager.AlarmConfiguration.alarm(
++                schedule: .fixed(fireDate),
++                attributes: attributes,
++                stopIntent: nil,
++                secondaryIntent: nil,
++                sound: .default
++            )
++            _ = try? await manager.schedule(id: UUID(), configuration: configuration)
++        }
++    }
++    #endif
++
 +    /// Cancels every pending and delivered reminder that belongs to the same series as `request`.
 +    static func cancelInsulinReminders(for request: UNNotificationRequest) {
 +        guard let series = request.content.userInfo[insulinReminderSeriesKey] as? String else {
@@ -144,8 +234,79 @@ index 996d147..af2b857 100644
      static func getAuthorization(_ completion: @escaping (UNAuthorizationStatus) -> Void) {
          UNUserNotificationCenter.current().getNotificationSettings { settings in
              completion(settings.authorizationStatus)
+diff --git a/Loop/Loop/View Models/BolusEntryViewModel.swift b/Loop/Loop/View Models/BolusEntryViewModel.swift
+index a86f20e..14d8806 100644
+--- a/Loop/Loop/View Models/BolusEntryViewModel.swift	
++++ b/Loop/Loop/View Models/BolusEntryViewModel.swift	
+@@ -30,7 +30,9 @@ protocol BolusEntryViewModelDelegate: AnyObject {
+     func storeManualBolusDosingDecision(_ bolusDosingDecision: BolusDosingDecision, withDate date: Date)
+     
+     func enactBolus(units: Double, activationType: BolusActivationType, completion: @escaping (_ error: Error?) -> Void)
+-    
++
++    func addManuallyEnteredDose(startDate: Date, units: Double, insulinType: InsulinType?)
++
+     func getGlucoseSamples(start: Date?, end: Date?, completion: @escaping (_ samples: Swift.Result<[StoredGlucoseSample], Error>) -> Void)
+ 
+     func insulinOnBoard(at date: Date, completion: @escaping (_ result: DoseStoreResult<InsulinValue>) -> Void)
+@@ -125,6 +127,12 @@ final class BolusEntryViewModel: ObservableObject {
+     @Published var isInitiatingSaveOrBolus = false
+     @Published var enacting = false
+ 
++    // MARK: - Afrezza quick-log (non-pump insulin logged alongside a bolus-screen entry)
++    // When a value is selected, the pump bolus is set to 0 and the selected Afrezza is logged
++    // (after Face ID) when the user presses the main action button. Never delivers a pump bolus.
++    @Published var selectedAfrezzaUnits: Double? = nil
++    @Published var afrezzaDoseTime: Date = Date()
++
+     private var dosingDecision = BolusDosingDecision(for: .normalBolus)
+ 
+     @Published var activeAlert: Alert?
+@@ -369,9 +377,14 @@ final class BolusEntryViewModel: ObservableObject {
+             }
+         }
+ 
+-        // Authenticate the bolus before saving anything
+-        if amountToDeliver > 0 {
+-            let message = String(format: NSLocalizedString("Authenticate to Bolus %@ Units", comment: "The message displayed during a device authentication prompt for bolus specification"), amountToDeliverString)
++        // Authenticate before saving anything — for a pump bolus and/or an Afrezza log.
++        if amountToDeliver > 0 || selectedAfrezzaUnits != nil {
++            let message: String
++            if amountToDeliver > 0 {
++                message = String(format: NSLocalizedString("Authenticate to Bolus %@ Units", comment: "The message displayed during a device authentication prompt for bolus specification"), amountToDeliverString)
++            } else {
++                message = NSLocalizedString("Authenticate to log insulin", comment: "The message displayed during a device authentication prompt to log a non-pump insulin dose")
++            }
+ 
+             if !(await authenticationHandler(message)) {
+                 return false
+@@ -414,6 +427,15 @@ final class BolusEntryViewModel: ObservableObject {
+             }
+         }
+ 
++        // Log the selected Afrezza (non-pump insulin) at the chosen time. This only records the
++        // dose so Loop accounts for it; it never delivers a pump bolus.
++        if let afrezzaUnits = selectedAfrezzaUnits {
++            delegate.addManuallyEnteredDose(startDate: afrezzaDoseTime, units: afrezzaUnits, insulinType: .afrezza)
++            if afrezzaDoseTime > self.now() {
++                NotificationManager.scheduleInsulinReminder(at: afrezzaDoseTime, units: afrezzaUnits, insulinType: .afrezza)
++            }
++        }
++
+         dosingDecision.manualBolusRequested = amountToDeliver
+ 
+         let now = self.now()
+@@ -845,7 +867,7 @@ extension BolusEntryViewModel {
+     }
+ 
+     private var hasDataToSave: Bool {
+-        manualGlucoseQuantity != nil || potentialCarbEntry != nil
++        manualGlucoseQuantity != nil || potentialCarbEntry != nil || selectedAfrezzaUnits != nil
+     }
+ 
+     enum ButtonChoice { case manualGlucoseEntry, actionButton }
 diff --git a/Loop/Loop/View Models/ManualEntryDoseViewModel.swift b/Loop/Loop/View Models/ManualEntryDoseViewModel.swift
-index 5fcd966..6a2afcb 100644
+index 5fcd966..220198d 100644
 --- a/Loop/Loop/View Models/ManualEntryDoseViewModel.swift	
 +++ b/Loop/Loop/View Models/ManualEntryDoseViewModel.swift	
 @@ -10,6 +10,7 @@ import Combine
@@ -163,12 +324,94 @@ index 5fcd966..6a2afcb 100644
 +
 +        // If the dose is logged ahead of time (future-dated), remind the user to actually take it.
 +        if selectedDoseDate > now() {
-+            NotificationManager.scheduleInsulinReminders(at: selectedDoseDate, units: doseVolume, insulinType: selectedInsulinType)
++            NotificationManager.scheduleInsulinReminder(at: selectedDoseDate, units: doseVolume, insulinType: selectedInsulinType)
 +        }
 +
          completion()
      }
  
+diff --git a/Loop/Loop/Views/BolusEntryView.swift b/Loop/Loop/Views/BolusEntryView.swift
+index fecd236..da98582 100644
+--- a/Loop/Loop/Views/BolusEntryView.swift
++++ b/Loop/Loop/Views/BolusEntryView.swift
+@@ -37,6 +37,7 @@ struct BolusEntryView: View {
+             VStack(spacing: 0) {
+                 List {
+                     self.chartSection
++                    self.afrezzaShortcutSection
+                     self.summarySection
+                 }
+                 .insetGroupedListStyle()
+@@ -158,6 +159,69 @@ struct BolusEntryView: View {
+         )
+     }
+ 
++    // MARK: - Afrezza quick-log
++
++    private var afrezzaShortcutSection: some View {
++        Section {
++            HStack(spacing: 12) {
++                // Colors sampled from the Afrezza cartridges: blue for 2 U, teal-green for 4 U.
++                afrezzaSelectButton(units: 2, color: Color(red: 49.0 / 255.0, green: 105.0 / 255.0, blue: 174.0 / 255.0))
++                afrezzaSelectButton(units: 4, color: Color(red: 33.0 / 255.0, green: 124.0 / 255.0, blue: 137.0 / 255.0))
++            }
++            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
++            .listRowBackground(Color.clear)
++
++            if viewModel.selectedAfrezzaUnits != nil {
++                DatePicker(
++                    selection: $viewModel.afrezzaDoseTime,
++                    in: Date().addingTimeInterval(-.hours(6))...Date().addingTimeInterval(.hours(6)),
++                    displayedComponents: [.hourAndMinute]
++                ) {
++                    Text("Afrezza time", comment: "Label for the Afrezza dose-time picker on the bolus screen")
++                }
++            }
++        }
++    }
++
++    private func afrezzaSelectButton(units: Double, color: Color) -> some View {
++        let isSelected = viewModel.selectedAfrezzaUnits == units
++        return Button(action: {
++            toggleAfrezza(units: units)
++        }) {
++            HStack(spacing: 6) {
++                if isSelected {
++                    Image(systemName: "checkmark.circle.fill")
++                }
++                Text("\(Int(units)) Afrezza")
++            }
++            .font(.headline)
++            .foregroundColor(.white)
++            .frame(maxWidth: .infinity, minHeight: 44)
++            .background(
++                RoundedRectangle(cornerRadius: 10)
++                    .fill(color.opacity(isSelected ? 1.0 : 0.5))
++            )
++        }
++        .buttonStyle(.plain)
++        .accessibilityLabel(Text("\(Int(units)) units of Afrezza"))
++        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
++    }
++
++    // Selecting an Afrezza amount is safe to tap repeatedly — it only arms the selection and
++    // zeroes the pump bolus. Nothing is logged until the main action button + Face ID.
++    private func toggleAfrezza(units: Double) {
++        if viewModel.selectedAfrezzaUnits == units {
++            viewModel.selectedAfrezzaUnits = nil
++        } else {
++            viewModel.selectedAfrezzaUnits = units
++            viewModel.afrezzaDoseTime = Date()
++            // Force the pump bolus to 0 so the action button will not deliver pump insulin.
++            editedBolusAmount = true
++            enteredBolusString = ""
++            viewModel.updateEnteredBolus("")
++        }
++    }
++
+     private var summarySection: some View {
+         Section {
+             VStack(spacing: 16) {
 diff --git a/Loop/Loop/Views/ManualEntryDoseView.swift b/Loop/Loop/Views/ManualEntryDoseView.swift
 index 4c55b6b..df3c0ae 100644
 --- a/Loop/Loop/Views/ManualEntryDoseView.swift
