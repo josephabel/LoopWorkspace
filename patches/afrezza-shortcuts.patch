@@ -1,1 +1,227 @@
-
+diff --git a/Loop/Loop/Managers/LoopAppManager.swift b/Loop/Loop/Managers/LoopAppManager.swift
+index 3f00104..d8c0f54 100644
+--- a/Loop/Loop/Managers/LoopAppManager.swift
++++ b/Loop/Loop/Managers/LoopAppManager.swift
+@@ -525,6 +525,10 @@ extension LoopAppManager: DeviceOrientationController {
+ 
+ extension LoopAppManager: UNUserNotificationCenterDelegate {
+     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
++        if notification.request.content.categoryIdentifier == NotificationManager.insulinReminderCategoryIdentifier {
++            completionHandler([.badge, .sound, .list, .banner])
++            return
++        }
+         switch notification.request.identifier {
+         // TODO: Until these notifications are converted to use the new alert system, they shall still show in the foreground
+         case LoopNotificationCategory.bolusFailure.rawValue,
+@@ -544,6 +548,13 @@ extension LoopAppManager: UNUserNotificationCenterDelegate {
+     }
+ 
+     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
++        // Any interaction with an insulin reminder — the "Taken ✓" action, a swipe-to-dismiss,
++        // or tapping it to open Loop — means the user has handled it, so cancel the whole series.
++        if response.notification.request.content.categoryIdentifier == NotificationManager.insulinReminderCategoryIdentifier {
++            NotificationManager.cancelInsulinReminders(for: response.notification.request)
++            completionHandler()
++            return
++        }
+         switch response.actionIdentifier {
+         case NotificationManager.Action.retryBolus.rawValue:
+             if  let units = response.notification.request.content.userInfo[LoopNotificationUserInfoKey.bolusAmount.rawValue] as? Double,
+diff --git a/Loop/Loop/Managers/NotificationManager.swift b/Loop/Loop/Managers/NotificationManager.swift
+index 996d147..af2b857 100644
+--- a/Loop/Loop/Managers/NotificationManager.swift
++++ b/Loop/Loop/Managers/NotificationManager.swift
+@@ -16,10 +16,15 @@ enum NotificationManager {
+     enum Action: String {
+         case retryBolus
+         case acknowledgeAlert
++        case markInsulinTaken
+     }
+ }
+ 
+ extension NotificationManager {
++    // MARK: - Insulin (e.g. Afrezza) reminder for future-dated manual doses
++    static let insulinReminderCategoryIdentifier = "com.loopkit.Loop.insulinReminder"
++    static let insulinReminderSeriesKey = "com.loopkit.Loop.insulinReminderSeries"
++
+     private static var notificationCategories: Set<UNNotificationCategory> {
+         var categories = [UNNotificationCategory]()
+ 
+@@ -49,9 +54,96 @@ extension NotificationManager {
+             options: .customDismissAction
+         ))
+ 
++        let markInsulinTakenAction = UNNotificationAction(
++            identifier: Action.markInsulinTaken.rawValue,
++            title: NSLocalizedString("Taken ✓", comment: "The title of the notification action confirming a logged insulin dose was taken"),
++            options: []
++        )
++
++        // .customDismissAction lets us cancel the remaining reminders in the series
++        // when the user swipes the notification away, not just when they tap "Taken ✓".
++        categories.append(UNNotificationCategory(
++            identifier: insulinReminderCategoryIdentifier,
++            actions: [markInsulinTakenAction],
++            intentIdentifiers: [],
++            options: .customDismissAction
++        ))
++
+         return Set(categories)
+     }
+ 
++    /// Schedules a series of time-sensitive reminders (default: every 2 minutes, up to 15 times)
++    /// starting at `fireDate`, to prompt the user to actually take a dose they logged ahead of time.
++    /// The series shares a random `series` id (in userInfo) so it can be cancelled as a group once
++    /// the user acts on any one of them (see `cancelInsulinReminders(for:)`).
++    static func scheduleInsulinReminders(at fireDate: Date,
++                                         units: Double,
++                                         insulinType: InsulinType?,
++                                         reminderCount: Int = 15,
++                                         interval: TimeInterval = 120) {
++        guard fireDate.timeIntervalSinceNow > 0 else { return }
++
++        let series = UUID().uuidString
++        let unitsString = insulinReminderNumberFormatter.string(from: NSNumber(value: units)) ?? String(units)
++        let typeString = insulinType?.title ?? NSLocalizedString("insulin", comment: "Generic insulin name used in the reminder when the type is unknown")
++
++        let center = UNUserNotificationCenter.current()
++        for index in 0..<max(1, reminderCount) {
++            let fireInterval = fireDate.timeIntervalSinceNow + interval * Double(index)
++            guard fireInterval > 0 else { continue }
++
++            let content = UNMutableNotificationContent()
++            content.title = NSLocalizedString("Take Your Insulin", comment: "Title for the insulin reminder notification")
++            content.body = String(format: NSLocalizedString("Reminder: take %1$@ U of %2$@ now. Swipe away or tap \"Taken ✓\" once you have.", comment: "Body for the insulin reminder notification (1: units, 2: insulin type)"), unitsString, typeString)
++            content.sound = .default
++            content.categoryIdentifier = insulinReminderCategoryIdentifier
++            content.userInfo = [insulinReminderSeriesKey: series]
++            if #available(iOS 15.0, *) {
++                content.interruptionLevel = .timeSensitive
++            }
++
++            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: fireInterval, repeats: false)
++            let request = UNNotificationRequest(
++                identifier: "\(insulinReminderCategoryIdentifier).\(series).\(index)",
++                content: content,
++                trigger: trigger
++            )
++            center.add(request)
++        }
++    }
++
++    /// Cancels every pending and delivered reminder that belongs to the same series as `request`.
++    static func cancelInsulinReminders(for request: UNNotificationRequest) {
++        guard let series = request.content.userInfo[insulinReminderSeriesKey] as? String else {
++            return
++        }
++        let center = UNUserNotificationCenter.current()
++        center.getPendingNotificationRequests { requests in
++            let ids = requests
++                .filter { ($0.content.userInfo[insulinReminderSeriesKey] as? String) == series }
++                .map { $0.identifier }
++            if !ids.isEmpty {
++                center.removePendingNotificationRequests(withIdentifiers: ids)
++            }
++        }
++        center.getDeliveredNotifications { notifications in
++            let ids = notifications
++                .filter { ($0.request.content.userInfo[insulinReminderSeriesKey] as? String) == series }
++                .map { $0.request.identifier }
++            if !ids.isEmpty {
++                center.removeDeliveredNotifications(withIdentifiers: ids)
++            }
++        }
++    }
++
++    private static let insulinReminderNumberFormatter: NumberFormatter = {
++        let formatter = NumberFormatter()
++        formatter.numberStyle = .decimal
++        formatter.minimumFractionDigits = 0
++        formatter.maximumFractionDigits = 2
++        return formatter
++    }()
++
+     static func getAuthorization(_ completion: @escaping (UNAuthorizationStatus) -> Void) {
+         UNUserNotificationCenter.current().getNotificationSettings { settings in
+             completion(settings.authorizationStatus)
+diff --git a/Loop/Loop/View Models/ManualEntryDoseViewModel.swift b/Loop/Loop/View Models/ManualEntryDoseViewModel.swift
+index 5fcd966..6a2afcb 100644
+--- a/Loop/Loop/View Models/ManualEntryDoseViewModel.swift	
++++ b/Loop/Loop/View Models/ManualEntryDoseViewModel.swift	
+@@ -10,6 +10,7 @@ import Combine
+ import HealthKit
+ import LocalAuthentication
+ import Intents
++import UserNotifications
+ import os.log
+ import LoopCore
+ import LoopKit
+@@ -196,6 +197,12 @@ final class ManualEntryDoseViewModel: ObservableObject {
+         }
+ 
+         delegate?.addManuallyEnteredDose(startDate: selectedDoseDate, units: doseVolume, insulinType: selectedInsulinType)
++
++        // If the dose is logged ahead of time (future-dated), remind the user to actually take it.
++        if selectedDoseDate > now() {
++            NotificationManager.scheduleInsulinReminders(at: selectedDoseDate, units: doseVolume, insulinType: selectedInsulinType)
++        }
++
+         completion()
+     }
+ 
+diff --git a/Loop/Loop/Views/ManualEntryDoseView.swift b/Loop/Loop/Views/ManualEntryDoseView.swift
+index 4c55b6b..df3c0ae 100644
+--- a/Loop/Loop/Views/ManualEntryDoseView.swift
++++ b/Loop/Loop/Views/ManualEntryDoseView.swift
+@@ -35,6 +35,7 @@ struct ManualEntryDoseView: View {
+             VStack(spacing: 0) {
+                 List {
+                     self.chartSection
++                    self.afrezzaShortcutSection
+                     self.summarySection
+                 }
+                 .insetGroupedListStyle()
+@@ -119,6 +120,43 @@ struct ManualEntryDoseView: View {
+         )
+     }
+ 
++    // MARK: - Afrezza quick-dose shortcuts
++
++    private var afrezzaShortcutSection: some View {
++        Section {
++            HStack(spacing: 12) {
++                // Colors sampled from the Afrezza cartridges: blue for the 2 U button, teal-green for the 4 U button.
++                afrezzaShortcutButton(units: 2, color: Color(red: 49.0 / 255.0, green: 105.0 / 255.0, blue: 174.0 / 255.0))
++                afrezzaShortcutButton(units: 4, color: Color(red: 33.0 / 255.0, green: 124.0 / 255.0, blue: 137.0 / 255.0))
++            }
++            .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
++            .listRowBackground(Color.clear)
++        }
++    }
++
++    private func afrezzaShortcutButton(units: Double, color: Color) -> some View {
++        Button(action: {
++            self.logAfrezzaShortcut(units: units)
++        }) {
++            Text("\(Int(units)) Afrezza")
++                .font(.headline)
++                .foregroundColor(.white)
++                .frame(maxWidth: .infinity, minHeight: 44)
++                .background(color)
++                .cornerRadius(10)
++        }
++        .buttonStyle(.plain)
++        .accessibilityLabel(Text("Log \(Int(units)) units of Afrezza"))
++    }
++
++    private func logAfrezzaShortcut(units: Double) {
++        viewModel.selectedInsulinType = .afrezza
++        viewModel.enteredBolus = HKQuantity(unit: .internationalUnit(), doubleValue: units)
++        enteredBolusString = Self.doseAmountFormatter.string(from: NSNumber(value: units)) ?? "\(Int(units))"
++        // Goes through the same Face ID / passcode confirmation as the Log Dose button.
++        viewModel.saveManualDose(onSuccess: self.dismiss)
++    }
++
+     private var summarySection: some View {
+         Section {
+             VStack(spacing: 16) {
