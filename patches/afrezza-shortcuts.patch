@@ -12,21 +12,22 @@ index db76e6e..3578767 100644
  	<string>The app needs to use Bluetooth to send and receive data from your diabetes devices.</string>
  	<key>NSBluetoothPeripheralUsageDescription</key>
 diff --git a/Loop/Loop/Managers/LoopAppManager.swift b/Loop/Loop/Managers/LoopAppManager.swift
-index 3f00104..d8c0f54 100644
+index 3f00104..c60b5c4 100644
 --- a/Loop/Loop/Managers/LoopAppManager.swift
 +++ b/Loop/Loop/Managers/LoopAppManager.swift
-@@ -525,6 +525,10 @@ extension LoopAppManager: DeviceOrientationController {
+@@ -525,6 +525,11 @@ extension LoopAppManager: DeviceOrientationController {
  
  extension LoopAppManager: UNUserNotificationCenterDelegate {
      func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-+        if notification.request.content.categoryIdentifier == NotificationManager.insulinReminderCategoryIdentifier {
++        if notification.request.content.categoryIdentifier == NotificationManager.insulinReminderCategoryIdentifier
++            || notification.request.content.categoryIdentifier == NotificationManager.bolusReminderCategoryIdentifier {
 +            completionHandler([.badge, .sound, .list, .banner])
 +            return
 +        }
          switch notification.request.identifier {
          // TODO: Until these notifications are converted to use the new alert system, they shall still show in the foreground
          case LoopNotificationCategory.bolusFailure.rawValue,
-@@ -544,6 +548,13 @@ extension LoopAppManager: UNUserNotificationCenterDelegate {
+@@ -544,6 +549,19 @@ extension LoopAppManager: UNUserNotificationCenterDelegate {
      }
  
      func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
@@ -37,14 +38,40 @@ index 3f00104..d8c0f54 100644
 +            completionHandler()
 +            return
 +        }
++        // Interacting with a bolus reminder (tap or dismiss) cancels the pending escalation alarm.
++        if response.notification.request.content.categoryIdentifier == NotificationManager.bolusReminderCategoryIdentifier {
++            NotificationManager.acknowledgeBolusReminder()
++            completionHandler()
++            return
++        }
          switch response.actionIdentifier {
          case NotificationManager.Action.retryBolus.rawValue:
              if  let units = response.notification.request.content.userInfo[LoopNotificationUserInfoKey.bolusAmount.rawValue] as? Double,
+diff --git a/Loop/Loop/Managers/LoopDataManager.swift b/Loop/Loop/Managers/LoopDataManager.swift
+index c9aef28..c17ab4d 100644
+--- a/Loop/Loop/Managers/LoopDataManager.swift
++++ b/Loop/Loop/Managers/LoopDataManager.swift
+@@ -500,6 +500,15 @@ final class LoopDataManager {
+         dosingDecisionStore.storeDosingDecision(dosingDecision) {}
+ 
+         NotificationCenter.default.post(name: .LoopCompleted, object: self)
++
++        // Bolus reminder (custom, READ-ONLY): read Loop's current recommended manual bolus (net of
++        // pending insulin/IOB) and let NotificationManager decide whether to nudge. Does not dose.
++        var recommendedManualBolusAmount = 0.0
++        if let predictedGlucoseIncludingPendingInsulin = predictedGlucoseIncludingPendingInsulin,
++           let recommendation = try? recommendManualBolus(forPrediction: predictedGlucoseIncludingPendingInsulin, consideringPotentialCarbEntry: nil) {
++            recommendedManualBolusAmount = recommendation.amount
++        }
++        NotificationManager.evaluateBolusReminder(recommendedAmount: recommendedManualBolusAmount)
+     }
+ 
+     private func loopDidError(date: Date, error: LoopError, dosingDecision: StoredDosingDecision, duration: TimeInterval) {
 diff --git a/Loop/Loop/Managers/NotificationManager.swift b/Loop/Loop/Managers/NotificationManager.swift
-index 996d147..e881132 100644
+index 996d147..321dde0 100644
 --- a/Loop/Loop/Managers/NotificationManager.swift
 +++ b/Loop/Loop/Managers/NotificationManager.swift
-@@ -8,18 +8,32 @@
+@@ -8,18 +8,41 @@
  
  import UIKit
  import UserNotifications
@@ -74,10 +101,19 @@ index 996d147..e881132 100644
 +    static let insulinReminderCategoryIdentifier = "com.loopkit.Loop.insulinReminder"
 +    static let insulinReminderSeriesKey = "com.loopkit.Loop.insulinReminderSeries"
 +
++    // MARK: - Bolus reminder (nudge when Loop's recommended manual bolus reaches a threshold)
++    static let bolusReminderCategoryIdentifier = "com.loopkit.Loop.bolusReminder"
++    static let bolusReminderEnabledKey = "com.loopkit.Loop.bolusReminderEnabled"
++    static let bolusReminderThresholdKey = "com.loopkit.Loop.bolusReminderThreshold"
++    private static let bolusReminderPrimaryID = "com.loopkit.Loop.bolusReminder.primary"
++    private static let bolusReminderEscalationID = "com.loopkit.Loop.bolusReminder.escalation"
++    private static var bolusReminderEpisodeActive = false
++    private static var bolusReminderAlarmID: UUID?
++
      private static var notificationCategories: Set<UNNotificationCategory> {
          var categories = [UNNotificationCategory]()
  
-@@ -49,9 +63,156 @@ extension NotificationManager {
+@@ -49,9 +72,295 @@ extension NotificationManager {
              options: .customDismissAction
          ))
  
@@ -92,6 +128,14 @@ index 996d147..e881132 100644
 +        categories.append(UNNotificationCategory(
 +            identifier: insulinReminderCategoryIdentifier,
 +            actions: [markInsulinTakenAction],
++            intentIdentifiers: [],
++            options: .customDismissAction
++        ))
++
++        // Bolus reminder: no action button; .customDismissAction so clearing it cancels the escalation.
++        categories.append(UNNotificationCategory(
++            identifier: bolusReminderCategoryIdentifier,
++            actions: [],
 +            intentIdentifiers: [],
 +            options: .customDismissAction
 +        ))
@@ -195,6 +239,137 @@ index 996d147..e881132 100644
 +                sound: .default
 +            )
 +            _ = try? await manager.schedule(id: UUID(), configuration: configuration)
++        }
++    }
++    #endif
++
++    // MARK: - Bolus reminder
++
++    /// Called once per loop cycle with Loop's current recommended manual bolus (units). Read-only:
++    /// this only decides whether to nudge the user; it never doses. All state is touched on main.
++    static func evaluateBolusReminder(recommendedAmount: Double) {
++        DispatchQueue.main.async {
++            let defaults = UserDefaults.standard
++            let enabled = (defaults.object(forKey: bolusReminderEnabledKey) as? Bool) ?? false
++            let threshold = (defaults.object(forKey: bolusReminderThresholdKey) as? Double) ?? 2.0
++
++            guard enabled else {
++                if bolusReminderEpisodeActive { clearBolusReminder() }
++                bolusReminderEpisodeActive = false
++                return
++            }
++
++            if recommendedAmount >= threshold {
++                // One nudge per episode; stay quiet while it remains high.
++                if !bolusReminderEpisodeActive {
++                    bolusReminderEpisodeActive = true
++                    fireBolusReminder(recommendedAmount: recommendedAmount)
++                }
++            } else {
++                // Recommendation dropped below threshold (e.g. user bolused) → reset the episode.
++                if bolusReminderEpisodeActive {
++                    bolusReminderEpisodeActive = false
++                    clearBolusReminder()
++                }
++            }
++        }
++    }
++
++    /// The user tapped or dismissed the bolus-reminder notification: cancel the pending escalation
++    /// alarm but leave the episode marked handled so it stays quiet until the recommendation resets.
++    static func acknowledgeBolusReminder() {
++        DispatchQueue.main.async {
++            cancelBolusEscalation()
++            UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [bolusReminderPrimaryID])
++        }
++    }
++
++    private static func fireBolusReminder(recommendedAmount: Double) {
++        let amountString = insulinReminderNumberFormatter.string(from: NSNumber(value: recommendedAmount)) ?? String(recommendedAmount)
++
++        let content = UNMutableNotificationContent()
++        content.title = NSLocalizedString("Bolus Suggested", comment: "Title for the bolus reminder notification")
++        content.body = String(format: NSLocalizedString("Loop is recommending about %@ U. Tap to review in Loop.", comment: "Body for the bolus reminder notification (1: units)"), amountString)
++        content.sound = .default
++        content.categoryIdentifier = bolusReminderCategoryIdentifier
++        if #available(iOS 15.0, *) { content.interruptionLevel = .timeSensitive }
++        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: bolusReminderPrimaryID, content: content, trigger: nil))
++
++        // Escalate to a full alarm in 10 minutes if the user hasn't acted.
++        let escalationDate = Date().addingTimeInterval(10 * 60)
++        let title = String(format: NSLocalizedString("Bolus Reminder: ~%@ U", comment: "Title for the bolus reminder escalation alarm (1: units)"), amountString)
++        #if canImport(AlarmKit)
++        if #available(iOS 26.0, *) {
++            let id = UUID()
++            bolusReminderAlarmID = id
++            scheduleBolusEscalationAlarm(id: id, at: escalationDate, title: title)
++            return
++        }
++        #endif
++        // Fallback (< iOS 26): a second time-sensitive notification.
++        let escalation = UNMutableNotificationContent()
++        escalation.title = NSLocalizedString("Bolus Reminder", comment: "Title for the bolus reminder escalation notification")
++        escalation.body = title
++        escalation.sound = .default
++        escalation.categoryIdentifier = bolusReminderCategoryIdentifier
++        if #available(iOS 15.0, *) { escalation.interruptionLevel = .timeSensitive }
++        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: max(1, escalationDate.timeIntervalSinceNow), repeats: false)
++        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: bolusReminderEscalationID, content: escalation, trigger: trigger))
++    }
++
++    private static func cancelBolusEscalation() {
++        let center = UNUserNotificationCenter.current()
++        center.removePendingNotificationRequests(withIdentifiers: [bolusReminderEscalationID])
++        center.removeDeliveredNotifications(withIdentifiers: [bolusReminderEscalationID])
++        #if canImport(AlarmKit)
++        if #available(iOS 26.0, *), let id = bolusReminderAlarmID {
++            try? AlarmManager.shared.cancel(id: id)
++        }
++        #endif
++        bolusReminderAlarmID = nil
++    }
++
++    private static func clearBolusReminder() {
++        let center = UNUserNotificationCenter.current()
++        center.removePendingNotificationRequests(withIdentifiers: [bolusReminderPrimaryID, bolusReminderEscalationID])
++        center.removeDeliveredNotifications(withIdentifiers: [bolusReminderPrimaryID, bolusReminderEscalationID])
++        cancelBolusEscalation()
++    }
++
++    #if canImport(AlarmKit)
++    @available(iOS 26.0, *)
++    private static func scheduleBolusEscalationAlarm(id: UUID, at fireDate: Date, title: String) {
++        guard fireDate.timeIntervalSinceNow > 0 else { return }
++        Task {
++            let manager = AlarmManager.shared
++            let authorized: Bool
++            switch manager.authorizationState {
++            case .authorized:
++                authorized = true
++            case .notDetermined:
++                authorized = ((try? await manager.requestAuthorization()) == .authorized)
++            default:
++                authorized = false
++            }
++            guard authorized else { return }
++
++            let alert = AlarmPresentation.Alert(
++                title: LocalizedStringResource(stringLiteral: title),
++                stopButton: AlarmButton(text: "OK", textColor: .white, systemImageName: "checkmark")
++            )
++            let attributes = AlarmAttributes<InsulinReminderAlarmMetadata>(
++                presentation: AlarmPresentation(alert: alert),
++                metadata: nil,
++                tintColor: Color(red: 33.0 / 255.0, green: 124.0 / 255.0, blue: 137.0 / 255.0)
++            )
++            let configuration = AlarmManager.AlarmConfiguration.alarm(
++                schedule: .fixed(fireDate),
++                attributes: attributes,
++                stopIntent: nil,
++                secondaryIntent: nil,
++                sound: .default
++            )
++            _ = try? await manager.schedule(id: id, configuration: configuration)
 +        }
 +    }
 +    #endif
@@ -468,3 +643,52 @@ index 4c55b6b..df3c0ae 100644
      private var summarySection: some View {
          Section {
              VStack(spacing: 16) {
+diff --git a/Loop/Loop/Views/SettingsView.swift b/Loop/Loop/Views/SettingsView.swift
+index aa0da33..975f0b7 100644
+--- a/Loop/Loop/Views/SettingsView.swift
++++ b/Loop/Loop/Views/SettingsView.swift
+@@ -24,6 +24,10 @@ public struct SettingsView: View {
+     @ObservedObject var viewModel: SettingsViewModel
+     @ObservedObject var versionUpdateViewModel: VersionUpdateViewModel
+ 
++    // Bolus reminder (custom): nudge when Loop's recommended manual bolus reaches a threshold.
++    @AppStorage("com.loopkit.Loop.bolusReminderEnabled") private var bolusReminderEnabled = false
++    @AppStorage("com.loopkit.Loop.bolusReminderThreshold") private var bolusReminderThreshold = 2.0
++
+     enum Destination {
+         enum Alert: String, Identifiable {
+             var id: String {
+@@ -77,6 +81,7 @@ public struct SettingsView: View {
+                         dosingStrategySection
+                     }
+                     alertManagementSection
++                    bolusReminderSection
+                     if viewModel.pumpManagerSettingsViewModel.isSetUp() {
+                         configurationSection
+                     }
+@@ -288,6 +293,25 @@ extension SettingsView {
+         .environment(\.insulinTintColor, self.insulinTintColor)
+     }
+ 
++    private var bolusReminderSection: some View {
++        Section(header: SectionHeader(label: NSLocalizedString("Bolus Reminder", comment: "Title of the custom Bolus Reminder settings section"))) {
++            Toggle(NSLocalizedString("Remind me to bolus", comment: "Toggle label for the bolus reminder feature"), isOn: $bolusReminderEnabled)
++            if bolusReminderEnabled {
++                Stepper(value: $bolusReminderThreshold, in: 0.5...10.0, step: 0.5) {
++                    HStack {
++                        Text(NSLocalizedString("Threshold", comment: "Label for the bolus reminder threshold row"))
++                        Spacer()
++                        Text(String(format: NSLocalizedString("%.1f U", comment: "Bolus reminder threshold value in units"), bolusReminderThreshold))
++                            .foregroundColor(.secondary)
++                    }
++                }
++                Text(NSLocalizedString("When Loop’s recommended bolus reaches this amount, you’ll get a time-sensitive reminder — and a full alarm 10 minutes later if you haven’t acted. Reminders never deliver insulin; you still bolus yourself in Loop.", comment: "Footer explaining the bolus reminder feature"))
++                    .font(.footnote)
++                    .foregroundColor(.secondary)
++            }
++        }
++    }
++
+     private var configurationSection: some View {
+         Section(header: SectionHeader(label: NSLocalizedString("Configuration", comment: "The title of the Configuration section in settings"))) {
+             NavigationLink(destination: therapySettingsView) {
